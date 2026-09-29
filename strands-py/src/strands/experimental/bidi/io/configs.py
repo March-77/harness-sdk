@@ -1,9 +1,12 @@
 """Configuration types for bidirectional I/O."""
 
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
+
+if TYPE_CHECKING:
+    from .console import ConsoleIO
 
 
-class BidiAudioProcessorConfig(TypedDict, total=False):
+class AudioProcessorConfig(TypedDict, total=False):
     """Configure microphone audio processing.
 
     Attributes:
@@ -15,10 +18,11 @@ class BidiAudioProcessorConfig(TypedDict, total=False):
     stream_delay_ms: int
 
 
-class BidiAudioIOConfig(TypedDict, total=False):
+class AudioIOConfig(TypedDict, total=False):
     """Configure bidirectional audio input and output."""
 
-    audio_processor: BidiAudioProcessorConfig | bool | None
+    audio_processor: AudioProcessorConfig | bool | None
+    console: "ConsoleIO"
     input_buffer_size: int | None
     input_device_index: int | None
     input_frames_per_buffer: int
@@ -27,4 +31,14 @@ class BidiAudioIOConfig(TypedDict, total=False):
     output_frames_per_buffer: int
 
 
-__all__ = ["BidiAudioIOConfig", "BidiAudioProcessorConfig"]
+class ConsoleIOConfig(TypedDict, total=False):
+    """Configure console input display and text, reasoning, transcript, and tool call output."""
+
+    placeholder: str
+    show_text: bool
+    show_reasoning: bool
+    show_transcript: bool
+    show_tools: bool
+
+
+__all__ = ["AudioIOConfig", "AudioProcessorConfig", "ConsoleIOConfig"]

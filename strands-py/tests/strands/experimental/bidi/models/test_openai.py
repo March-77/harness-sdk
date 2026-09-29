@@ -16,20 +16,33 @@ import unittest.mock
 
 import pytest
 
-from strands.experimental.bidi.models import BidiModelTimeoutError, OpenAIRealtimeModel
+from strands.experimental.bidi import BidiAgent
+from strands.experimental.bidi.models import ConnectionTimeoutError, OpenAIRealtimeModel
 from strands.experimental.bidi.models.openai import (
     _RESTART_INSTRUCTION,
     OPENAI_MAX_TIMEOUT_S,
     OPENAI_PROACTIVE_RECONNECT_MARGIN_S,
+    _SessionState,
 )
 from strands.experimental.bidi.types import (
     AudioDelta,
-    BidiAudioStreamEvent,
+    BidiAudioDeltaEvent,
+    BidiAudioStartEvent,
+    BidiAudioStopEvent,
+    BidiBargeInEvent,
     BidiConnectionStartEvent,
-    BidiInterruptionEvent,
-    BidiResponseCompleteEvent,
-    BidiTranscriptCompleteEvent,
-    BidiTranscriptStreamEvent,
+    BidiMessage,
+    BidiResponseStartEvent,
+    BidiResponseStopEvent,
+    BidiTextBlockEvent,
+    BidiTextDeltaEvent,
+    BidiTextStartEvent,
+    BidiTextStopEvent,
+    BidiToolUseBlocksEvent,
+    BidiTranscriptBlockEvent,
+    BidiTranscriptDeltaEvent,
+    BidiTranscriptStartEvent,
+    BidiTranscriptStopEvent,
 )
 from strands.types.content import TextBlock
 from strands.types.media import ImageBlock
@@ -58,8 +71,8 @@ def mock_websockets_connect(mock_websocket):
 
 
 @pytest.fixture
-def model_name():
-    return "gpt-realtime"
+def model_id():
+    return "gpt-realtime-2.1"
 
 
 @pytest.fixture
@@ -68,9 +81,9 @@ def api_key():
 
 
 @pytest.fixture
-def model(mock_websockets_connect, api_key, model_name):
+def model(mock_websockets_connect, api_key, model_id):
     """Create an OpenAIRealtimeModel instance."""
-    return OpenAIRealtimeModel(model_id=model_name, api_key=api_key)
+    return OpenAIRealtimeModel(transcription_model_id="gpt-4o-transcribe", model_id=model_id, api_key=api_key)
 
 
 @pytest.fixture
@@ -92,17 +105,67 @@ def messages():
     return [{"role": "user", "content": [{"text": "Hello"}]}]
 
 
+@pytest.mark.asyncio
+async def test_receive_preserves_native_order_with_late_transcription(model, mock_websocket, model_id):
+    native_events = [
+        {"type": "input_audio_buffer.committed", "item_id": "user-1"},
+        {"type": "response.created", "response": {"id": "r1"}},
+        {"type": "response.created", "response": {"id": "r1"}},
+        {"type": "response.cancelled", "response": {"id": "r1"}},
+        {"type": "response.done", "response": {"id": "r1", "status": "cancelled"}},
+        {"type": "response.done", "response": {"id": "r1", "status": "cancelled"}},
+        {"type": "conversation.item.input_audio_transcription.delta", "item_id": "user-1", "delta": "Earlier input."},
+        {"type": "response.created", "response": {"id": "r2"}},
+        {"type": "response.done", "response": {"id": "r2", "status": "completed"}},
+        {"type": "input_audio_buffer.committed", "item_id": "user-2"},
+        {"type": "conversation.item.input_audio_transcription.delta", "item_id": "user-2", "delta": "Hi"},
+        {"type": "conversation.item.input_audio_transcription.completed", "item_id": "user-2", "transcript": "Hi"},
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "user-1",
+            "transcript": "Earlier input.",
+        },
+    ]
+    mock_websocket.recv.side_effect = [json.dumps(event) for event in native_events]
+    exp_events = [
+        BidiConnectionStartEvent(connection_id=unittest.mock.ANY, model=model_id),
+        BidiTranscriptStartEvent("user", content_id="user-1"),
+        BidiResponseStartEvent("r1"),
+        BidiResponseStopEvent("r1"),
+        BidiTranscriptDeltaEvent("Earlier input.", "user", content_id="user-1"),
+        BidiResponseStartEvent("r2"),
+        BidiResponseStopEvent("r2"),
+        BidiTranscriptStartEvent("user", content_id="user-2"),
+        BidiTranscriptDeltaEvent("Hi", "user", content_id="user-2"),
+        BidiTranscriptStopEvent("user", content_id="user-2"),
+        BidiTranscriptStopEvent("user", content_id="user-1"),
+    ]
+
+    await model.start()
+    reader = model.receive()
+    try:
+        tru_events = [await anext(reader) for _ in exp_events]
+        assert tru_events == exp_events
+        assert model._session_state.active_responses == set()
+        assert model._session_state.started_transcripts == {}
+    finally:
+        await reader.aclose()
+        await model.stop()
+
+
 # Initialization Tests
 
 
-def test_model_initialization(api_key, model_name, monkeypatch):
+def test_model_initialization(api_key, model_id, monkeypatch):
     """Test model initialization with various configurations."""
-    model_default = OpenAIRealtimeModel(api_key="test-key")
-    assert model_default.model_id == "gpt-realtime"
+    model_default = OpenAIRealtimeModel(
+        model_id=model_id, transcription_model_id="gpt-4o-transcribe", api_key="test-key"
+    )
+    assert model_default.model_id == model_id
     assert model_default.api_key == "test-key"
     tru_config = model_default.get_config()
     exp_config = {
-        "model_id": "gpt-realtime",
+        "model_id": model_id,
         "params": {},
         "connection": {"restart_after_s": OPENAI_MAX_TIMEOUT_S - OPENAI_PROACTIVE_RECONNECT_MARGIN_S},
     }
@@ -112,27 +175,53 @@ def test_model_initialization(api_key, model_name, monkeypatch):
     assert model_default.get_config() == exp_config
     assert model_default.get_config() is tru_config
 
+    model_default.update_config()
+    assert model_default.get_config() == exp_config
+    assert model_default.get_config() is tru_config
+
     model_custom = OpenAIRealtimeModel(
-        model_id=model_name,
+        transcription_model_id="gpt-4o-transcribe",
+        model_id=model_id,
         api_key=api_key,
         organization="org-explicit",
         project="proj-explicit",
     )
-    assert model_custom.model_id == model_name
+    assert model_custom.model_id == model_id
     assert model_custom.api_key == api_key
     assert model_custom.organization == "org-explicit"
     assert model_custom.project == "proj-explicit"
 
     monkeypatch.setenv("OPENAI_ORGANIZATION", "org-123")
     monkeypatch.setenv("OPENAI_PROJECT", "proj-456")
-    model_env = OpenAIRealtimeModel(model_id=model_name, api_key=api_key)
+    model_env = OpenAIRealtimeModel(transcription_model_id="gpt-4o-transcribe", model_id=model_id, api_key=api_key)
     assert model_env.organization == "org-123"
     assert model_env.project == "proj-456"
 
     # Test with env API key
     monkeypatch.setenv("OPENAI_API_KEY", "env-key")
-    model_env = OpenAIRealtimeModel()
+    model_env = OpenAIRealtimeModel(model_id=model_id, transcription_model_id="gpt-4o-transcribe")
     assert model_env.api_key == "env-key"
+
+
+@pytest.mark.parametrize("model_config", [{}, {"model_id": None}, {"model_id": ""}, {"model_id": 123}])
+def test__init__rejects_invalid_model_id(api_key, model_config):
+    with pytest.raises(ValueError, match="model_id"):
+        OpenAIRealtimeModel(transcription_model_id="gpt-4o-transcribe", api_key=api_key, **model_config)
+
+
+@pytest.mark.parametrize("invalid_model_id", [None, "", 123])
+def test_update_config_rejects_invalid_model_id(model, invalid_model_id):
+    config = model.get_config()
+    exp_config = dict(config)
+    audio_config = model.get_audio_config()
+
+    with pytest.raises(ValueError, match="model_id must be a non-empty string"):
+        model.update_config(model_id=invalid_model_id, params={"max_output_tokens": 2048}, connection={})
+
+    tru_config = model.get_config()
+    assert tru_config == exp_config
+    assert tru_config is config
+    assert model.get_audio_config() is audio_config
 
 
 # Audio Configuration Tests
@@ -145,8 +234,10 @@ def test_model_initialization(api_key, model_name, monkeypatch):
         pytest.param({"voice": "echo"}, "echo", id="custom-voice"),
     ],
 )
-def test_get_audio_config(api_key, options, voice):
-    model = OpenAIRealtimeModel(api_key=api_key, **options)
+def test_get_audio_config(model_id, api_key, options, voice):
+    model = OpenAIRealtimeModel(
+        model_id=model_id, transcription_model_id="gpt-4o-transcribe", api_key=api_key, **options
+    )
 
     tru_config = model.get_audio_config()
     exp_config = {
@@ -172,9 +263,14 @@ def test_get_audio_config(api_key, options, voice):
         {"type": "audio/mp3"},
     ],
 )
-def test__init__rejects_unsupported_audio_format(api_key, direction, audio_format):
+def test__init__rejects_unsupported_audio_format(model_id, api_key, direction, audio_format):
     with pytest.raises(ValueError, match="Unsupported"):
-        OpenAIRealtimeModel(api_key=api_key, params={"audio": {direction: {"format": audio_format}}})
+        OpenAIRealtimeModel(
+            model_id=model_id,
+            transcription_model_id="gpt-4o-transcribe",
+            api_key=api_key,
+            params={"audio": {direction: {"format": audio_format}}},
+        )
 
 
 @pytest.mark.parametrize("direction", ["input", "output"])
@@ -185,8 +281,13 @@ def test__init__rejects_unsupported_audio_format(api_key, direction, audio_forma
         {"rate": 16000},
     ],
 )
-def test_update_config_rejects_unsupported_audio_format(api_key, direction, audio_format):
-    model = OpenAIRealtimeModel(api_key=api_key, params={"max_output_tokens": 2048})
+def test_update_config_rejects_unsupported_audio_format(model_id, api_key, direction, audio_format):
+    model = OpenAIRealtimeModel(
+        model_id=model_id,
+        transcription_model_id="gpt-4o-transcribe",
+        api_key=api_key,
+        params={"max_output_tokens": 2048},
+    )
     audio_config = model.get_audio_config()
 
     with pytest.raises(ValueError, match="Unsupported"):
@@ -194,7 +295,7 @@ def test_update_config_rejects_unsupported_audio_format(api_key, direction, audi
 
     tru_config = model.get_config()
     exp_config = {
-        "model_id": "gpt-realtime",
+        "model_id": "gpt-realtime-2.1",
         "params": {"max_output_tokens": 2048},
         "connection": {"restart_after_s": OPENAI_MAX_TIMEOUT_S - OPENAI_PROACTIVE_RECONNECT_MARGIN_S},
     }
@@ -202,11 +303,11 @@ def test_update_config_rejects_unsupported_audio_format(api_key, direction, audi
     assert model.get_audio_config() is audio_config
 
 
-def test_init_without_api_key_raises(monkeypatch):
+def test_init_without_api_key_raises(model_id, monkeypatch):
     """Test that initialization without API key raises error."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     with pytest.raises(ValueError, match="OpenAI API key is required"):
-        OpenAIRealtimeModel()
+        OpenAIRealtimeModel(model_id=model_id, transcription_model_id="gpt-4o-transcribe")
 
 
 # Connection Tests
@@ -225,6 +326,7 @@ async def test_connection_lifecycle(mock_websockets_connect, model, system_promp
 
     # Test close
     await model.stop()
+
     mock_ws.close.assert_called_once()
 
     # Test connection with system prompt
@@ -252,12 +354,12 @@ async def test_connection_lifecycle(mock_websockets_connect, model, system_promp
 
 
 @pytest.mark.asyncio
-async def test_connection_with_org_header(mock_websockets_connect, monkeypatch):
+async def test_connection_with_org_header(model_id, mock_websockets_connect, monkeypatch):
     """Test connection with organization header from environment."""
     mock_connect, mock_ws = mock_websockets_connect
 
     monkeypatch.setenv("OPENAI_ORGANIZATION", "org-123")
-    model_org = OpenAIRealtimeModel(api_key="test-key")
+    model_org = OpenAIRealtimeModel(model_id=model_id, transcription_model_id="gpt-4o-transcribe", api_key="test-key")
     await model_org.start()
     call_kwargs = mock_connect.call_args.kwargs
     headers = call_kwargs.get("additional_headers", [])
@@ -332,12 +434,12 @@ async def test_connection_with_message_history(mock_websockets_connect, model):
 
 
 @pytest.mark.asyncio
-async def test_connection_edge_cases(mock_websockets_connect, api_key, model_name):
+async def test_connection_edge_cases(mock_websockets_connect, api_key, model_id):
     """Test connection error handling and edge cases."""
     mock_connect, mock_ws = mock_websockets_connect
 
     # Test connection error
-    model1 = OpenAIRealtimeModel(model_id=model_name, api_key=api_key)
+    model1 = OpenAIRealtimeModel(transcription_model_id="gpt-4o-transcribe", model_id=model_id, api_key=api_key)
     mock_connect.side_effect = Exception("Connection failed")
     with pytest.raises(Exception, match="Connection failed"):
         await model1.start()
@@ -349,18 +451,18 @@ async def test_connection_edge_cases(mock_websockets_connect, api_key, model_nam
     mock_connect.side_effect = async_connect
 
     # Test double connection
-    model2 = OpenAIRealtimeModel(model_id=model_name, api_key=api_key)
+    model2 = OpenAIRealtimeModel(transcription_model_id="gpt-4o-transcribe", model_id=model_id, api_key=api_key)
     await model2.start()
     with pytest.raises(RuntimeError, match=r"call stop before starting again"):
         await model2.start()
     await model2.stop()
 
     # Test close when not connected
-    model3 = OpenAIRealtimeModel(model_id=model_name, api_key=api_key)
+    model3 = OpenAIRealtimeModel(transcription_model_id="gpt-4o-transcribe", model_id=model_id, api_key=api_key)
     await model3.stop()  # Should not raise
 
     # Test close error
-    model4 = OpenAIRealtimeModel(model_id=model_name, api_key=api_key)
+    model4 = OpenAIRealtimeModel(transcription_model_id="gpt-4o-transcribe", model_id=model_id, api_key=api_key)
     await model4.start()
     mock_ws.close.side_effect = Exception("Close failed")
     with pytest.raises(Exception, match=r"failed stop sequence"):
@@ -371,23 +473,96 @@ async def test_connection_edge_cases(mock_websockets_connect, api_key, model_nam
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("blocks", "exp_content"),
+    [
+        (
+            [TextBlock("First"), TextBlock("Second")],
+            [{"type": "input_text", "text": "First"}, {"type": "input_text", "text": "Second"}],
+        ),
+        (
+            [
+                TextBlock("Describe this image"),
+                ImageBlock(format="jpeg", source={"bytes": b"image"}),
+                TextBlock("Be brief"),
+            ],
+            [
+                {"type": "input_text", "text": "Describe this image"},
+                {"type": "input_image", "image_url": "data:image/jpeg;base64,aW1hZ2U="},
+                {"type": "input_text", "text": "Be brief"},
+            ],
+        ),
+    ],
+    ids=["text", "mixed"],
+)
+async def test_send_message_creates_one_message_and_response(mock_websockets_connect, model, blocks, exp_content):
+    _, mock_ws = mock_websockets_connect
+    await model.start()
+    mock_ws.send.reset_mock()
+    try:
+        await model.send(BidiMessage(content=blocks))
+
+        tru_events = [json.loads(call.args[0]) for call in mock_ws.send.await_args_list]
+        exp_events = [
+            {
+                "type": "conversation.item.create",
+                "item": {"id": unittest.mock.ANY, "type": "message", "role": "user", "content": exp_content},
+            },
+            {"type": "response.create"},
+        ]
+        assert tru_events == exp_events
+    finally:
+        await model.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("block", "error_message"),
+    [
+        (ImageBlock(format="jpeg", source={}), "image source must contain bytes"),
+        (AudioDelta(format="pcm", source={"bytes": b"audio"}), "content not supported"),
+    ],
+    ids=["missing-image-bytes", "unsupported-block"],
+)
+async def test_send_message_rejects_invalid_blocks_before_sending(mock_websockets_connect, model, block, error_message):
+    _, mock_ws = mock_websockets_connect
+    await model.start()
+    mock_ws.send.reset_mock()
+    try:
+        with pytest.raises(ValueError, match=error_message):
+            await model.send(BidiMessage(content=[TextBlock("Hello"), block]))
+        mock_ws.send.assert_not_awaited()
+    finally:
+        await model.stop()
+
+
+@pytest.mark.asyncio
 async def test_send_all_content_types(mock_websockets_connect, model):
     """Test sending all content types through unified send() method."""
     _, mock_ws = mock_websockets_connect
     await model.start()
 
     # Test text input
-    await model.send(TextBlock("Hello"))
+    assert await model.send(BidiMessage(content=[TextBlock("Hello")])) is None
     calls = mock_ws.send.call_args_list
     messages = [json.loads(call[0][0]) for call in calls]
     item_create = [m for m in messages if m.get("type") == "conversation.item.create"]
     response_create = [m for m in messages if m.get("type") == "response.create"]
     assert len(item_create) > 0
     assert len(response_create) > 0
+    assert item_create[-1] == {
+        "type": "conversation.item.create",
+        "item": {
+            "id": unittest.mock.ANY,
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Hello"}],
+        },
+    }
 
     # Test audio input
     audio_b64 = base64.b64encode(b"audio_bytes").decode("utf-8")
-    await model.send(AudioDelta(format="pcm", source={"bytes": b"audio_bytes"}))
+    assert await model.send(AudioDelta(format="pcm", source={"bytes": b"audio_bytes"})) is None
     calls = mock_ws.send.call_args_list
     messages = [json.loads(call[0][0]) for call in calls]
     audio_append = [m for m in messages if m.get("type") == "input_audio_buffer.append"]
@@ -398,7 +573,7 @@ async def test_send_all_content_types(mock_websockets_connect, model):
 
     # Test tool result with text content
     tool_result = ToolResultBlock(tool_use_id="tool-123", status="success", content=[{"text": "Result: 42"}])
-    await model.send(tool_result)
+    await model.send(BidiMessage(content=[tool_result]))
     calls = mock_ws.send.call_args_list
     messages = [json.loads(call[0][0]) for call in calls]
     item_create = [m for m in messages if m.get("type") == "conversation.item.create"]
@@ -414,7 +589,7 @@ async def test_send_all_content_types(mock_websockets_connect, model):
     tool_result_json = ToolResultBlock(
         tool_use_id="tool-456", status="success", content=[{"json": {"result": 42, "status": "ok"}}]
     )
-    await model.send(tool_result_json)
+    await model.send(BidiMessage(content=[tool_result_json]))
     calls = mock_ws.send.call_args_list
     messages = [json.loads(call[0][0]) for call in calls]
     item_create = [m for m in messages if m.get("type") == "conversation.item.create"]
@@ -431,7 +606,7 @@ async def test_send_all_content_types(mock_websockets_connect, model):
         status="success",
         content=[{"text": "Part 1"}, {"json": {"data": "value"}}, {"text": "Part 2"}],
     )
-    await model.send(tool_result_multi)
+    await model.send(BidiMessage(content=[tool_result_multi]))
     calls = mock_ws.send.call_args_list
     messages = [json.loads(call[0][0]) for call in calls]
     item_create = [m for m in messages if m.get("type") == "conversation.item.create"]
@@ -449,7 +624,7 @@ async def test_send_all_content_types(mock_websockets_connect, model):
         content=[{"image": {"format": "jpeg", "source": {"bytes": b"image_data"}}}],
     )
     with pytest.raises(ValueError, match=r"Content type not supported by OpenAI Realtime API"):
-        await model.send(tool_result_image)
+        await model.send(BidiMessage(content=[tool_result_image]))
 
     # Test tool result with document content (should raise error)
     tool_result_doc = ToolResultBlock(
@@ -458,7 +633,7 @@ async def test_send_all_content_types(mock_websockets_connect, model):
         content=[{"document": {"format": "pdf", "source": {"bytes": b"doc_data"}}}],
     )
     with pytest.raises(ValueError, match=r"Content type not supported by OpenAI Realtime API"):
-        await model.send(tool_result_doc)
+        await model.send(BidiMessage(content=[tool_result_doc]))
 
     await model.stop()
 
@@ -470,25 +645,29 @@ async def test_send_edge_cases(mock_websockets_connect, model):
 
     # Test send when inactive
     with pytest.raises(RuntimeError, match=r"call start before sending"):
-        await model.send(TextBlock("Hello"))
+        await model.send(BidiMessage(content=[TextBlock("Hello")]))
     mock_ws.send.assert_not_called()
 
     # Test image input (sent as input_image content block on user message)
     await model.start()
     mock_ws.send.reset_mock()
     image_b64 = base64.b64encode(b"image_bytes").decode("utf-8")
-    await model.send(ImageBlock(format="jpeg", source={"bytes": b"image_bytes"}))
+    assert await model.send(BidiMessage(content=[ImageBlock(format="jpeg", source={"bytes": b"image_bytes"})])) is None
 
-    # Verify exactly one event was sent: a conversation.item.create with input_image
+    # The image is delivered as one conversation item before requesting a response.
     image_calls = [json.loads(call[0][0]) for call in mock_ws.send.call_args_list]
-    image_creates = [m for m in image_calls if m.get("type") == "conversation.item.create"]
-    assert len(image_creates) == 1, "expected exactly one conversation.item.create for image"
-    image_item = image_creates[0].get("item", {})
-    assert image_item.get("type") == "message"
-    assert image_item.get("role") == "user"
-    assert image_item.get("content") == [{"type": "input_image", "image_url": f"data:image/jpeg;base64,{image_b64}"}]
-    # Image input must NOT auto-trigger a response — caller decides when to commit.
-    assert not any(m.get("type") == "response.create" for m in image_calls)
+    assert image_calls == [
+        {
+            "type": "conversation.item.create",
+            "item": {
+                "id": unittest.mock.ANY,
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_image", "image_url": f"data:image/jpeg;base64,{image_b64}"}],
+            },
+        },
+        {"type": "response.create"},
+    ]
 
     await model.stop()
 
@@ -505,20 +684,126 @@ async def test_receive_lifecycle_events(mock_websocket, model):
     await model.start()
 
     receiver = model.receive()
-    tru_events = [await anext(receiver), await anext(receiver)]
+    tru_events = [await anext(receiver) for _ in range(3)]
     exp_events = [
         BidiConnectionStartEvent(connection_id=model._connection_id, model="updated-model"),
-        BidiAudioStreamEvent(
-            audio="",
-            format="pcm",
-            sample_rate=24000,
-            channels=1,
-        ),
+        BidiAudioStartEvent(content_id=unittest.mock.ANY),
+        BidiAudioDeltaEvent(audio="", format="pcm", sample_rate=24000, channels=1, content_id=unittest.mock.ANY),
     ]
     assert tru_events == exp_events
 
     await receiver.aclose()
     await model.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("committed", [False, True])
+async def test_receive_transcription_failure(mock_websocket, model, committed):
+    await model.start()
+    native_events = ([{"type": "input_audio_buffer.committed", "item_id": "speech-a"}] if committed else []) + [
+        {
+            "type": "conversation.item.input_audio_transcription.failed",
+            "item_id": "speech-a",
+            "error": {"message": "The audio could not be transcribed."},
+        },
+    ]
+    mock_websocket.recv.side_effect = [json.dumps(event) for event in native_events]
+    exp_events = [
+        BidiConnectionStartEvent(model._connection_id, model.get_config()["model_id"]),
+    ]
+    if committed:
+        exp_events.append(BidiTranscriptStartEvent("user", "speech-a"))
+    receiver = model.receive()
+    try:
+        tru_events = [await anext(receiver) for _ in exp_events]
+        assert tru_events == exp_events
+        with pytest.raises(RuntimeError, match="The audio could not be transcribed."):
+            await anext(receiver)
+    finally:
+        await receiver.aclose()
+        await model.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second_item_id,second_content_index", [("item-2", 0), ("item-1", 1)])
+@pytest.mark.parametrize("status", ["completed", "cancelled", "failed"])
+@pytest.mark.parametrize("output_type", ["audio_transcript", "text"])
+@pytest.mark.parametrize("stream_deltas", [False, True])
+async def test_receive_combines_assistant_content(
+    model, mock_websocket, second_item_id, second_content_index, status, output_type, stream_deltas
+):
+    """Native content parts stream immediately and complete one assistant message."""
+    native_events = [{"type": "response.created", "response": {"id": "r1"}}]
+    contents = [("item-1", 0, "Let me explain."), (second_item_id, second_content_index, "Here is the answer.")]
+    text_field = "transcript" if output_type == "audio_transcript" else "text"
+    content_type = "output_audio" if output_type == "audio_transcript" else "output_text"
+    output_items = {}
+    for item_id, content_index, text in contents:
+        identity = {"response_id": "r1", "item_id": item_id, "content_index": content_index}
+        if stream_deltas:
+            native_events.extend(
+                [
+                    {"type": f"response.output_{output_type}.delta", **identity, "delta": text},
+                    {"type": f"response.output_{output_type}.done", **identity, text_field: text},
+                ]
+            )
+        item = output_items.setdefault(item_id, {"id": item_id, "type": "message", "role": "assistant", "content": []})
+        item["content"].append({"type": content_type, text_field: text})
+    native_events.append(
+        {"type": "response.done", "response": {"id": "r1", "status": status, "output": list(output_items.values())}}
+    )
+    final_text = "Let me explain.\n\nHere is the answer."
+    deltas = ["Let me explain.", "\n\nHere is the answer."] if stream_deltas else [final_text]
+    exp_content_events = (
+        [
+            BidiTranscriptStartEvent("assistant", "r1"),
+            *[BidiTranscriptDeltaEvent(delta, "assistant", "r1") for delta in deltas],
+            BidiTranscriptStopEvent("assistant", "r1"),
+            BidiTranscriptBlockEvent(final_text, "assistant", "r1"),
+        ]
+        if output_type == "audio_transcript"
+        else [
+            BidiTextStartEvent("r1:text"),
+            *[BidiTextDeltaEvent(delta, "r1:text") for delta in deltas],
+            BidiTextStopEvent("r1:text"),
+            BidiTextBlockEvent(final_text, "r1:text"),
+        ]
+    )
+    exp_events = [
+        BidiConnectionStartEvent(unittest.mock.ANY, model.model_id),
+        BidiResponseStartEvent("r1"),
+        *exp_content_events,
+        BidiResponseStopEvent("r1"),
+    ]
+    incoming = asyncio.Queue()
+    for event in native_events:
+        incoming.put_nowait(json.dumps(event))
+    mock_websocket.recv.side_effect = incoming.get
+
+    agent = BidiAgent(model=model)
+    await agent.start()
+    try:
+        receiver = agent.receive()
+        tru_events = [await asyncio.wait_for(anext(receiver), timeout=2) for _ in exp_events]
+        assert tru_events == exp_events
+        tru_messages = agent.messages
+        exp_messages = [
+            {
+                "role": "assistant",
+                "content": [{"text": final_text}],
+                "metadata": {
+                    "custom": {
+                        "bidi": {"kind": "text" if output_type == "text" else "transcript", "status": "complete"}
+                    }
+                },
+                "tracking_id": unittest.mock.ANY,
+            }
+        ]
+        assert tru_messages == exp_messages
+        assert model._session_state.started_transcripts == {}
+        assert model._session_state.assistant_parts == {}
+    finally:
+        await agent.stop()
 
 
 @unittest.mock.patch("strands.experimental.bidi.models.openai.time.time")
@@ -529,7 +814,7 @@ async def test_receive_timeout(mock_time, model):
 
     await model.start()
 
-    with pytest.raises(BidiModelTimeoutError, match=r"timeout_s=<1>"):
+    with pytest.raises(ConnectionTimeoutError, match=r"timeout_s=<1>"):
         async for _ in model.receive():
             pass
 
@@ -539,62 +824,38 @@ async def test_event_conversion(model):
     """Test conversion of all OpenAI event types to standard format."""
     await model.start()
 
-    # Test audio output (now returns list with BidiAudioStreamEvent)
+    # Audio starts before its first chunk.
     audio_event = {"type": "response.output_audio.delta", "delta": base64.b64encode(b"audio_data").decode()}
     converted = model._convert_openai_event(audio_event)
-    assert isinstance(converted, list)
-    assert len(converted) == 1
-    assert isinstance(converted[0], BidiAudioStreamEvent)
-    assert converted[0].get("type") == "bidi_audio_stream"
-    assert converted[0].get("audio") == base64.b64encode(b"audio_data").decode()
-    assert converted[0].get("format") == "pcm"
+    assert converted == [
+        BidiAudioStartEvent(content_id=unittest.mock.ANY),
+        BidiAudioDeltaEvent(
+            base64.b64encode(b"audio_data").decode(),
+            format="pcm",
+            sample_rate=24000,
+            channels=1,
+            content_id=unittest.mock.ANY,
+        ),
+    ]
 
-    # Test function call sequence
-    item_added = {
-        "type": "response.output_item.added",
-        "item": {"type": "function_call", "call_id": "call-123", "name": "calculator"},
-    }
-    model._convert_openai_event(item_added)
+    for event_type in (
+        "response.output_item.added",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+    ):
+        assert model._convert_openai_event({"type": event_type}) is None
 
-    args_delta = {
-        "type": "response.function_call_arguments.delta",
-        "call_id": "call-123",
-        "delta": '{"expression": "2+2"}',
-    }
-    model._convert_openai_event(args_delta)
+    speech_started = {"type": "input_audio_buffer.speech_started", "item_id": "speech"}
+    tru_events = model._convert_openai_event(speech_started)
+    exp_events = [
+        BidiBargeInEvent("user_speech"),
+        BidiTranscriptStartEvent("user", "speech"),
+    ]
+    assert tru_events == exp_events
 
-    args_done = {"type": "response.function_call_arguments.done", "call_id": "call-123"}
-    converted = model._convert_openai_event(args_done)
-    # Now returns list with ToolUseStreamEvent
-    assert isinstance(converted, list)
-    assert len(converted) == 1
-    # ToolUseStreamEvent has delta and current_tool_use, not a "type" field
-    assert "delta" in converted[0]
-    assert "toolUse" in converted[0]["delta"]
-    tool_use = converted[0]["delta"]["toolUse"]
-    assert tool_use["toolUseId"] == "call-123"
-    assert tool_use["name"] == "calculator"
-    assert json.loads(tool_use["input"]) == {"expression": "2+2"}
-    assert converted[0]["current_tool_use"]["input"] == {"expression": "2+2"}
-
-    # Test voice activity (now returns list with BidiInterruptionEvent for speech_started)
-    speech_started = {"type": "input_audio_buffer.speech_started"}
-    converted = model._convert_openai_event(speech_started)
-    assert isinstance(converted, list)
-    assert len(converted) == 1
-    assert isinstance(converted[0], BidiInterruptionEvent)
-    assert converted[0].get("type") == "bidi_interruption"
-    assert converted[0].get("reason") == "user_speech"
-
-    # Test response.cancelled event (should return ResponseCompleteEvent with interrupted reason)
-    response_cancelled = {"type": "response.cancelled", "response": {"id": "resp_123"}}
+    response_cancelled = {"type": "response.done", "response": {"id": "resp_123", "status": "cancelled"}}
     converted = model._convert_openai_event(response_cancelled)
-    assert isinstance(converted, list)
-    assert len(converted) == 1
-    assert isinstance(converted[0], BidiResponseCompleteEvent)
-    assert converted[0].get("type") == "bidi_response_complete"
-    assert converted[0].get("response_id") == "resp_123"
-    assert converted[0].get("stop_reason") == "interrupted"
+    assert converted == [BidiResponseStopEvent("resp_123")]
 
     # Test error handling - response_cancel_not_active should be suppressed
     error_cancel_not_active = {
@@ -613,85 +874,191 @@ async def test_event_conversion(model):
 
 
 @pytest.mark.parametrize(
-    ("event", "expected"),
+    ("event", "exp_events"),
     [
         pytest.param(
-            {"type": "response.output_text.delta", "delta": "Hello from OpenAI"},
-            BidiTranscriptStreamEvent("Hello from OpenAI", "assistant"),
+            {"type": "response.output_text.delta", "delta": "Hello from OpenAI", "response_id": "response-1"},
+            [
+                BidiTextStartEvent("response-1:text"),
+                BidiTextDeltaEvent("Hello from OpenAI", "response-1:text"),
+            ],
             id="output_text_delta",
         ),
         pytest.param(
-            {"type": "response.output_audio_transcript.delta", "delta": "Spoken response"},
-            BidiTranscriptStreamEvent("Spoken response", "assistant"),
+            {"type": "response.output_audio_transcript.delta", "delta": "Spoken response", "response_id": "response-1"},
+            [
+                BidiTranscriptStartEvent("assistant", "response-1"),
+                BidiTranscriptDeltaEvent("Spoken response", "assistant", "response-1"),
+            ],
             id="output_audio_transcript_delta",
         ),
         pytest.param(
-            {"type": "response.output_text.delta", "delta": " "},
-            BidiTranscriptStreamEvent(" ", "assistant"),
+            {"type": "response.output_text.delta", "delta": " ", "response_id": "response-1"},
+            [BidiTextStartEvent("response-1:text"), BidiTextDeltaEvent(" ", "response-1:text")],
             id="whitespace_output_text_delta",
         ),
         pytest.param(
-            {"type": "response.output_audio_transcript.done", "transcript": "Spoken response"},
-            BidiTranscriptCompleteEvent("Spoken response", "assistant"),
+            {
+                "type": "response.output_audio_transcript.done",
+                "transcript": "Spoken response",
+                "response_id": "response-1",
+            },
+            None,
             id="output_audio_transcript_done",
         ),
         pytest.param(
-            {"type": "response.output_text.done", "text": "Hello from OpenAI"},
-            BidiTranscriptCompleteEvent("Hello from OpenAI", "assistant"),
+            {"type": "response.output_text.done", "text": "Hello from OpenAI", "response_id": "response-1"},
+            None,
             id="output_text_done",
         ),
         pytest.param(
-            {"type": "response.output_text.done", "text": ""},
-            BidiTranscriptCompleteEvent("", "assistant"),
+            {"type": "response.output_text.done", "text": "", "response_id": "response-1"},
+            None,
             id="empty_output_text_done",
         ),
         pytest.param(
-            {"type": "conversation.item.input_audio_transcription.delta", "delta": "User question"},
-            BidiTranscriptStreamEvent("User question", "user"),
+            {
+                "type": "conversation.item.input_audio_transcription.delta",
+                "delta": "User question",
+                "item_id": "input-1",
+            },
+            [
+                BidiTranscriptStartEvent("user", "input-1"),
+                BidiTranscriptDeltaEvent("User question", "user", "input-1"),
+            ],
             id="input_audio_transcription_delta",
         ),
         pytest.param(
-            {"type": "conversation.item.input_audio_transcription.delta", "delta": " "},
-            BidiTranscriptStreamEvent(" ", "user"),
+            {"type": "conversation.item.input_audio_transcription.delta", "delta": " ", "item_id": "input-1"},
+            [BidiTranscriptStartEvent("user", "input-1"), BidiTranscriptDeltaEvent(" ", "user", "input-1")],
             id="whitespace_input_audio_transcription_delta",
         ),
         pytest.param(
-            {"type": "conversation.item.input_audio_transcription.completed", "transcript": "User question"},
-            BidiTranscriptCompleteEvent("User question", "user"),
+            {
+                "type": "conversation.item.input_audio_transcription.completed",
+                "transcript": "User question",
+                "item_id": "input-1",
+            },
+            [
+                BidiTranscriptStartEvent("user", "input-1"),
+                BidiTranscriptDeltaEvent("User question", "user", "input-1"),
+                BidiTranscriptStopEvent("user", "input-1"),
+            ],
             id="input_audio_transcription_completed",
         ),
         pytest.param(
-            {"type": "conversation.item.input_audio_transcription.completed", "transcript": ""},
-            BidiTranscriptCompleteEvent("", "user"),
+            {"type": "conversation.item.input_audio_transcription.completed", "transcript": "", "item_id": "input-1"},
+            [BidiTranscriptStartEvent("user", "input-1"), BidiTranscriptStopEvent("user", "input-1")],
             id="empty_input_audio_transcription_completed",
         ),
         pytest.param(
             {
                 "type": "conversation.item.input_audio_transcription.segment",
                 "segment": {"text": "User question", "role": "user"},
+                "item_id": "input-1",
             },
-            BidiTranscriptStreamEvent("User question", "user"),
+            [
+                BidiTranscriptStartEvent("user", "input-1"),
+                BidiTranscriptDeltaEvent("User question", "user", "input-1"),
+            ],
             id="input_audio_transcription_segment",
         ),
         pytest.param(
             {
                 "type": "conversation.item.input_audio_transcription.segment",
                 "segment": {"text": " ", "role": "user"},
+                "item_id": "input-1",
             },
-            BidiTranscriptStreamEvent(" ", "user"),
+            [BidiTranscriptStartEvent("user", "input-1"), BidiTranscriptDeltaEvent(" ", "user", "input-1")],
             id="whitespace_input_audio_transcription_segment",
         ),
     ],
 )
-def test_convert_openai_event_transcript(model, event, expected):
-    assert model._convert_openai_event(event) == [expected]
+def test_convert_openai_event_text_and_transcript(model, event, exp_events):
+    if event["type"].startswith("response."):
+        event = {**event, "item_id": "item-1", "content_index": 0}
+    tru_events = model._convert_openai_event(event)
+    assert tru_events == exp_events
+    if event["type"] == "conversation.item.input_audio_transcription.completed":
+        assert model._session_state.started_transcripts == {}
+
+
+@pytest.mark.parametrize("stream_deltas", [False, True])
+def test_convert_openai_event_keeps_text_separate_from_transcripts(model, stream_deltas):
+    if stream_deltas:
+        tru_events = []
+        for output_type, content_index, delta in [
+            ("text", 0, "Written"),
+            ("audio_transcript", 1, "Spoken"),
+            ("text", 0, " answer."),
+            ("audio_transcript", 1, " answer."),
+        ]:
+            tru_events.extend(
+                model._convert_openai_event(
+                    {
+                        "type": f"response.output_{output_type}.delta",
+                        "response_id": "r1",
+                        "item_id": "item-1",
+                        "content_index": content_index,
+                        "delta": delta,
+                    }
+                )
+            )
+        exp_events = [
+            BidiTextStartEvent("r1:text"),
+            BidiTextDeltaEvent("Written", "r1:text"),
+            BidiTranscriptStartEvent("assistant", "r1"),
+            BidiTranscriptDeltaEvent("Spoken", "assistant", "r1"),
+            BidiTextDeltaEvent(" answer.", "r1:text"),
+            BidiTranscriptDeltaEvent(" answer.", "assistant", "r1"),
+        ]
+        assert tru_events == exp_events
+    tru_events = model._convert_openai_event(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "r1",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_text", "text": "Written answer."},
+                            {"type": "output_audio", "transcript": "Spoken answer."},
+                        ],
+                    }
+                ],
+            },
+        }
+    )
+    exp_events = [
+        *(
+            [BidiTranscriptStartEvent("assistant", "r1"), BidiTranscriptDeltaEvent("Spoken answer.", "assistant", "r1")]
+            if not stream_deltas
+            else []
+        ),
+        BidiTranscriptStopEvent("assistant", "r1"),
+        *(
+            [BidiTextStartEvent("r1:text"), BidiTextDeltaEvent("Written answer.", "r1:text")]
+            if not stream_deltas
+            else []
+        ),
+        BidiTextStopEvent("r1:text"),
+        BidiResponseStopEvent("r1"),
+    ]
+    assert tru_events == exp_events
+    assert model._session_state.started_transcripts == {}
+    assert model._session_state.assistant_parts == {}
 
 
 # Helper Method Tests
 
 
-def test__build_session_config_direct_options(api_key, system_prompt, tool_spec):
+@pytest.mark.parametrize("transcription_model_id", ["custom-transcription-model", None])
+def test__build_session_config_direct_options(model_id, api_key, system_prompt, tool_spec, transcription_model_id):
     model = OpenAIRealtimeModel(
+        model_id=model_id,
+        transcription_model_id=transcription_model_id,
         api_key=api_key,
         voice="coral",
     )
@@ -707,12 +1074,17 @@ def test__build_session_config_direct_options(api_key, system_prompt, tool_spec)
         }
     ]
     assert config["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
+    tru_transcription = config["audio"]["input"]["transcription"]
+    exp_transcription = {"model": transcription_model_id} if transcription_model_id is not None else None
+    assert tru_transcription == exp_transcription
     assert config["audio"]["output"] == {"format": {"type": "audio/pcm", "rate": 24000}, "voice": "coral"}
 
 
-def test__build_session_config_passes_through_params(api_key):
+def test__build_session_config_passes_through_params(model_id, api_key):
     """Test model params are passed through to the session."""
     model = OpenAIRealtimeModel(
+        model_id=model_id,
+        transcription_model_id="gpt-4o-transcribe",
         api_key=api_key,
         params={"max_output_tokens": 2048, "tracing": "auto", "future_option": {"enabled": True}},
     )
@@ -724,9 +1096,22 @@ def test__build_session_config_passes_through_params(api_key):
     assert config["future_option"] == {"enabled": True}
 
 
-def test__build_session_config_merges_params_last(api_key, system_prompt, tool_spec):
+@pytest.mark.parametrize(
+    "transcription_model_id,transcription_override,exp_transcription",
+    [
+        ("direct-model", {"language": "en"}, {"model": "direct-model", "language": "en"}),
+        ("direct-model", {"model": "params-model"}, {"model": "params-model"}),
+        ("direct-model", None, None),
+        (None, {"model": "params-model"}, {"model": "params-model"}),
+    ],
+)
+def test__build_session_config_merges_params_last(
+    model_id, api_key, system_prompt, tool_spec, transcription_model_id, transcription_override, exp_transcription
+):
     """Params override direct options while preserving unspecified nested defaults."""
     model = OpenAIRealtimeModel(
+        model_id=model_id,
+        transcription_model_id=transcription_model_id,
         api_key=api_key,
         voice="echo",
         params={
@@ -735,8 +1120,8 @@ def test__build_session_config_merges_params_last(api_key, system_prompt, tool_s
             "audio": {
                 "input": {
                     "format": {"rate": 24000},
-                    "transcription": {"language": "en"},
-                    "turn_detection": {"threshold": 0.3, "prefix_padding_ms": 0, "create_response": False},
+                    "transcription": transcription_override,
+                    "turn_detection": {"threshold": 0.3, "prefix_padding_ms": 0, "create_response": True},
                 },
                 "output": {"format": {"rate": 24000}, "voice": "coral"},
             },
@@ -752,13 +1137,13 @@ def test__build_session_config_merges_params_last(api_key, system_prompt, tool_s
         "audio": {
             "input": {
                 "format": {"type": "audio/pcm", "rate": 24000},
-                "transcription": {"model": "gpt-4o-transcribe", "language": "en"},
+                "transcription": exp_transcription,
                 "turn_detection": {
                     "type": "server_vad",
                     "threshold": 0.3,
                     "prefix_padding_ms": 0,
                     "silence_duration_ms": 500,
-                    "create_response": False,
+                    "create_response": True,
                 },
             },
             "output": {"format": {"type": "audio/pcm", "rate": 24000}, "voice": "coral"},
@@ -767,9 +1152,11 @@ def test__build_session_config_merges_params_last(api_key, system_prompt, tool_s
     assert tru_config == exp_config
 
 
-def test__build_session_config_preserves_defaults(model, api_key, system_prompt, tool_spec):
+def test__build_session_config_preserves_defaults(model_id, model, api_key, system_prompt, tool_spec):
     exp_config = model._build_session_config(None, None)
     custom_model = OpenAIRealtimeModel(
+        model_id=model_id,
+        transcription_model_id="gpt-4o-transcribe",
         api_key=api_key,
         voice="coral",
         params={"output_modalities": ["text"]},
@@ -783,12 +1170,33 @@ def test__build_session_config_preserves_defaults(model, api_key, system_prompt,
 
 
 @pytest.mark.asyncio
-async def test_start_preserves_explicit_nulls(api_key, mock_websockets_connect):
+@pytest.mark.parametrize(
+    "turn_detection",
+    [None, {"create_response": False}, {"interrupt_response": False}],
+    ids=["vad-disabled", "automatic-response-disabled", "interruption-disabled"],
+)
+async def test_start_requires_automatic_voice_responses(model, mock_websockets_connect, turn_detection):
+    model.update_config(params={"audio": {"input": {"turn_detection": turn_detection}}})
+
+    with pytest.raises(
+        ValueError, match="requires turn detection with create_response=True and interrupt_response=True"
+    ):
+        await model.start()
+
+    mock_connect, _ = mock_websockets_connect
+    mock_connect.assert_not_called()
+    assert model._connection_id is None
+
+
+@pytest.mark.asyncio
+async def test_start_preserves_explicit_nulls(model_id, api_key, mock_websockets_connect):
     """Session updates preserve explicit null overrides."""
     _, mock_ws = mock_websockets_connect
     model = OpenAIRealtimeModel(
+        model_id=model_id,
+        transcription_model_id="gpt-4o-transcribe",
         api_key=api_key,
-        params={"audio": {"input": {"turn_detection": None, "transcription": None}}, "tracing": None},
+        params={"audio": {"input": {"transcription": None}}, "tracing": None},
     )
 
     await model.start(system_prompt="Test instructions")
@@ -804,7 +1212,12 @@ async def test_start_preserves_explicit_nulls(api_key, mock_websockets_connect):
                 "input": {
                     "format": {"type": "audio/pcm", "rate": 24000},
                     "transcription": None,
-                    "turn_detection": None,
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 500,
+                    },
                 },
                 "output": {"format": {"type": "audio/pcm", "rate": 24000}, "voice": "alloy"},
             },
@@ -812,6 +1225,37 @@ async def test_start_preserves_explicit_nulls(api_key, mock_websockets_connect):
         },
     }
     assert tru_event == exp_event
+    assert not model._session_state.transcription_enabled
+    await model.stop()
+
+
+@pytest.mark.asyncio
+async def test_disabled_transcription_does_not_associate_audio_with_missing_transcript(
+    model_id, api_key, mock_websockets_connect
+):
+    model = OpenAIRealtimeModel(model_id=model_id, api_key=api_key, transcription_model_id=None)
+    await model.start()
+    native_events = [
+        {"type": "input_audio_buffer.speech_started", "item_id": "speech"},
+        {"type": "input_audio_buffer.committed", "item_id": "speech"},
+        {
+            "type": "conversation.item.added",
+            "item": {"id": "speech", "role": "user", "content": [{"type": "input_audio"}]},
+        },
+        {"type": "response.created", "response": {"id": "a"}},
+        {
+            "type": "conversation.item.added",
+            "item": {"id": "text", "role": "user", "content": [{"type": "input_text", "text": "Hello"}]},
+        },
+        {"type": "response.created", "response": {"id": "b"}},
+    ]
+    tru_events = [event for native in native_events for event in model._convert_openai_event(native) or []]
+    exp_events = [
+        BidiBargeInEvent("user_speech"),
+        BidiResponseStartEvent("a"),
+        BidiResponseStartEvent("b"),
+    ]
+    assert tru_events == exp_events
     await model.stop()
 
 
@@ -823,8 +1267,10 @@ async def test_start_preserves_explicit_nulls(api_key, mock_websockets_connect):
         pytest.param({"audio": {"output": {"voice": "shimmer"}}}, "shimmer", id="replacement"),
     ],
 )
-def test_update_config_replaces_params(api_key, params, exp_voice):
+def test_update_config_replaces_params(model_id, api_key, params, exp_voice):
     model = OpenAIRealtimeModel(
+        model_id=model_id,
+        transcription_model_id="gpt-4o-transcribe",
         api_key=api_key,
         voice="coral",
         params={"instructions": "Params instructions", "audio": {"output": {"voice": "echo"}}},
@@ -854,34 +1300,6 @@ def test_tool_conversion(model, tool_spec):
     assert openai_empty == []
 
 
-def test_helper_methods(model):
-    """Test various helper methods."""
-    # Test _create_text_event
-    text_event = model._create_text_event("Hello", "user")
-    assert isinstance(text_event, BidiTranscriptStreamEvent)
-    assert text_event.get("type") == "bidi_transcript_stream"
-    assert text_event.get("delta") == "Hello"
-    assert text_event.get("role") == "user"
-    assert text_event.delta == "Hello"
-
-    # Test _create_voice_activity_event (now returns BidiInterruptionEvent for speech_started)
-    voice_event = model._create_voice_activity_event("speech_started")
-    assert isinstance(voice_event, BidiInterruptionEvent)
-    assert voice_event.get("type") == "bidi_interruption"
-    assert voice_event.get("reason") == "user_speech"
-
-    # Other voice activities return None
-    assert model._create_voice_activity_event("speech_stopped") is None
-
-
-@pytest.mark.parametrize("raw_role,expected", [("USER", "user"), ("Assistant", "assistant"), ("system", "user")])
-def test_create_text_event_normalizes_role(model, raw_role, expected):
-    """The raw provider role passes through; the event constructor is the single normalization point."""
-    text_event = model._create_text_event("Hello", raw_role)
-
-    assert text_event.role == expected
-
-
 @pytest.mark.asyncio
 async def test_send_event_helper(mock_websockets_connect, model):
     """Test _send_event helper method."""
@@ -900,12 +1318,150 @@ async def test_send_event_helper(mock_websockets_connect, model):
 
 
 @pytest.mark.parametrize("voice", ["alloy", "echo"])
-def test__convert_openai_event_audio_format(api_key, voice):
-    model = OpenAIRealtimeModel(api_key=api_key, voice=voice)
+def test__convert_openai_event_audio_format(model_id, api_key, voice):
+    model = OpenAIRealtimeModel(
+        model_id=model_id, transcription_model_id="gpt-4o-transcribe", api_key=api_key, voice=voice
+    )
     audio_base64 = base64.b64encode(b"audio data").decode()
 
     tru_events = model._convert_openai_event({"type": "response.output_audio.delta", "delta": audio_base64})
-    exp_events = [BidiAudioStreamEvent(audio=audio_base64, format="pcm", sample_rate=24000, channels=1)]
+    exp_events = [
+        BidiAudioStartEvent(content_id=unittest.mock.ANY),
+        BidiAudioDeltaEvent(
+            audio=audio_base64, format="pcm", sample_rate=24000, channels=1, content_id=unittest.mock.ANY
+        ),
+    ]
+    assert tru_events == exp_events
+
+
+@pytest.mark.parametrize("native_start", [False, True])
+@pytest.mark.parametrize("native_stop", [False, True])
+@pytest.mark.parametrize("status", ["completed", "cancelled", "failed"])
+def test_audio_boundaries(model, native_start, native_stop, status):
+    """Each audio stream stops once, including cancelled responses and missing native boundaries."""
+    native_events = [{"type": "response.created", "response": {"id": "r1"}}]
+    if native_start:
+        native_events.append({"type": "response.content_part.added", "response_id": "r1", "part": {"type": "audio"}})
+    native_events.extend(
+        [
+            {"type": "response.output_audio.delta", "response_id": "r1", "delta": "YQ=="},
+            {"type": "response.output_audio.delta", "response_id": "r1", "delta": "Yg=="},
+        ]
+    )
+    if native_stop:
+        native_events.append({"type": "response.output_audio.done", "response_id": "r1"})
+    native_events.append({"type": "response.done", "response": {"id": "r1", "status": status}})
+
+    tru_events = [event for native in native_events for event in model._convert_openai_event(native) or []]
+    content_id = tru_events[1].content_id
+    assert isinstance(content_id, str)
+    exp_events = [
+        BidiResponseStartEvent("r1"),
+        BidiAudioStartEvent(content_id),
+        BidiAudioDeltaEvent("YQ==", format="pcm", sample_rate=24000, channels=1, content_id=content_id),
+        BidiAudioDeltaEvent("Yg==", format="pcm", sample_rate=24000, channels=1, content_id=content_id),
+        BidiAudioStopEvent(content_id),
+        BidiResponseStopEvent("r1"),
+    ]
+    assert tru_events == exp_events
+    assert model._convert_openai_event({"type": "response.output_audio.done", "response_id": "r1"}) is None
+    assert model._session_state.audio_content_ids == {}
+
+
+def test_audio_ids_distinguish_overlapping_and_reopened_streams(model):
+    def delta(response_id):
+        return model._convert_openai_event(
+            {"type": "response.output_audio.delta", "response_id": response_id, "delta": "YQ=="}
+        )
+
+    first_events = delta("r1")
+    second_events = delta("r2")
+    first_id = first_events[0].content_id
+    second_id = second_events[0].content_id
+    assert first_id != second_id
+    assert first_events == [
+        BidiAudioStartEvent(first_id),
+        BidiAudioDeltaEvent("YQ==", "pcm", 24000, 1, first_id),
+    ]
+    assert second_events == [
+        BidiAudioStartEvent(second_id),
+        BidiAudioDeltaEvent("YQ==", "pcm", 24000, 1, second_id),
+    ]
+    assert delta("r1") == [BidiAudioDeltaEvent("YQ==", "pcm", 24000, 1, first_id)]
+    assert model._convert_openai_event({"type": "response.output_audio.done", "response_id": "r1"}) == [
+        BidiAudioStopEvent(first_id)
+    ]
+    next_events = delta("r1")
+    next_id = next_events[0].content_id
+    assert next_id not in {first_id, second_id}
+    assert next_events == [
+        BidiAudioStartEvent(next_id),
+        BidiAudioDeltaEvent("YQ==", "pcm", 24000, 1, next_id),
+    ]
+    assert model._convert_openai_event({"type": "response.done", "response": {"id": "r2"}}) == [
+        BidiAudioStopEvent(second_id),
+        BidiResponseStopEvent("r2"),
+    ]
+    assert model._convert_openai_event({"type": "response.done", "response": {"id": "r1"}}) == [
+        BidiAudioStopEvent(next_id),
+        BidiResponseStopEvent("r1"),
+    ]
+    assert model._session_state.audio_content_ids == {}
+
+
+@pytest.mark.parametrize(
+    ("item_type", "status", "exp_events"),
+    [
+        (
+            "function_call",
+            "completed",
+            [BidiToolUseBlocksEvent([{"toolUseId": "call-123", "name": "calculator", "input": {"expression": "2+2"}}])],
+        ),
+        ("function_call", "incomplete", None),
+        ("message", "completed", None),
+        ("function_call_output", "completed", None),
+    ],
+)
+def test_completed_output_item_emits_tool_call(model, item_type, status, exp_events):
+    native_event = {
+        "type": "response.output_item.done",
+        "item": {
+            "type": item_type,
+            "status": status,
+            "call_id": "call-123",
+            "name": "calculator",
+            "arguments": '{"expression": "2+2"}',
+        },
+    }
+
+    tru_events = model._convert_openai_event(native_event)
+    assert tru_events == exp_events
+
+
+@pytest.mark.parametrize("pending_tools", [set(), {"other-call"}])
+@pytest.mark.parametrize(
+    "output_types,status",
+    [
+        ([], "completed"),
+        (["message"], "completed"),
+        (["function_call_output"], "completed"),
+        (["function_call"], "completed"),
+        (["message", "function_call", "function_call"], "completed"),
+        (["function_call"], "cancelled"),
+        (["function_call"], "incomplete"),
+        (["function_call"], "failed"),
+    ],
+)
+def test_response_stop_with_tools(model, pending_tools, output_types, status):
+    """Response completion is independent of tool calls and provider status."""
+    model._session_state.pending_tools.update(pending_tools)
+    native_event = {
+        "type": "response.done",
+        "response": {"id": "r1", "status": status, "output": [{"type": item_type} for item_type in output_types]},
+    }
+
+    tru_events = model._convert_openai_event(native_event)
+    exp_events = [BidiResponseStopEvent("r1")]
     assert tru_events == exp_events
 
 
@@ -913,15 +1469,15 @@ def test__convert_openai_event_audio_format(api_key, voice):
 
 
 @pytest.mark.asyncio
-async def test_tool_result_single_text_content(mock_websockets_connect, api_key):
+async def test_tool_result_single_text_content(model_id, mock_websockets_connect, api_key):
     """Test tool result with single text content block."""
     _, mock_ws = mock_websockets_connect
-    model = OpenAIRealtimeModel(api_key=api_key)
+    model = OpenAIRealtimeModel(model_id=model_id, transcription_model_id="gpt-4o-transcribe", api_key=api_key)
     await model.start()
 
     tool_result = ToolResultBlock(tool_use_id="call-123", status="success", content=[{"text": "Simple text result"}])
 
-    await model.send(tool_result)
+    await model.send(BidiMessage(content=[tool_result]))
 
     # Verify the sent event
     calls = mock_ws.send.call_args_list
@@ -940,17 +1496,17 @@ async def test_tool_result_single_text_content(mock_websockets_connect, api_key)
 
 
 @pytest.mark.asyncio
-async def test_tool_result_single_json_content(mock_websockets_connect, api_key):
+async def test_tool_result_single_json_content(model_id, mock_websockets_connect, api_key):
     """Test tool result with single JSON content block."""
     _, mock_ws = mock_websockets_connect
-    model = OpenAIRealtimeModel(api_key=api_key)
+    model = OpenAIRealtimeModel(model_id=model_id, transcription_model_id="gpt-4o-transcribe", api_key=api_key)
     await model.start()
 
     tool_result = ToolResultBlock(
         tool_use_id="call-456", status="success", content=[{"json": {"temperature": 72, "condition": "sunny"}}]
     )
 
-    await model.send(tool_result)
+    await model.send(BidiMessage(content=[tool_result]))
 
     # Verify the sent event
     calls = mock_ws.send.call_args_list
@@ -968,10 +1524,10 @@ async def test_tool_result_single_json_content(mock_websockets_connect, api_key)
 
 
 @pytest.mark.asyncio
-async def test_tool_result_multiple_content_blocks(mock_websockets_connect, api_key):
+async def test_tool_result_multiple_content_blocks(model_id, mock_websockets_connect, api_key):
     """Test tool result with multiple content blocks (text and json)."""
     _, mock_ws = mock_websockets_connect
-    model = OpenAIRealtimeModel(api_key=api_key)
+    model = OpenAIRealtimeModel(model_id=model_id, transcription_model_id="gpt-4o-transcribe", api_key=api_key)
     await model.start()
 
     tool_result = ToolResultBlock(
@@ -984,7 +1540,7 @@ async def test_tool_result_multiple_content_blocks(mock_websockets_connect, api_
         ],
     )
 
-    await model.send(tool_result)
+    await model.send(BidiMessage(content=[tool_result]))
 
     # Verify the sent event
     calls = mock_ws.send.call_args_list
@@ -1006,10 +1562,10 @@ async def test_tool_result_multiple_content_blocks(mock_websockets_connect, api_
 
 
 @pytest.mark.asyncio
-async def test_tool_result_image_content_raises_error(mock_websockets_connect, api_key):
+async def test_tool_result_image_content_raises_error(model_id, mock_websockets_connect, api_key):
     """Test that tool result with image content raises ValueError."""
     _, mock_ws = mock_websockets_connect
-    model = OpenAIRealtimeModel(api_key=api_key)
+    model = OpenAIRealtimeModel(model_id=model_id, transcription_model_id="gpt-4o-transcribe", api_key=api_key)
     await model.start()
 
     tool_result = ToolResultBlock(
@@ -1019,16 +1575,16 @@ async def test_tool_result_image_content_raises_error(mock_websockets_connect, a
     )
 
     with pytest.raises(ValueError, match=r"Content type not supported by OpenAI Realtime API"):
-        await model.send(tool_result)
+        await model.send(BidiMessage(content=[tool_result]))
 
     await model.stop()
 
 
 @pytest.mark.asyncio
-async def test_tool_result_document_content_raises_error(mock_websockets_connect, api_key):
+async def test_tool_result_document_content_raises_error(model_id, mock_websockets_connect, api_key):
     """Test that tool result with document content raises ValueError."""
     _, mock_ws = mock_websockets_connect
-    model = OpenAIRealtimeModel(api_key=api_key)
+    model = OpenAIRealtimeModel(model_id=model_id, transcription_model_id="gpt-4o-transcribe", api_key=api_key)
     await model.start()
 
     tool_result = ToolResultBlock(
@@ -1038,7 +1594,7 @@ async def test_tool_result_document_content_raises_error(mock_websockets_connect
     )
 
     with pytest.raises(ValueError, match=r"Content type not supported by OpenAI Realtime API"):
-        await model.send(tool_result)
+        await model.send(BidiMessage(content=[tool_result]))
 
     await model.stop()
 
@@ -1046,9 +1602,9 @@ async def test_tool_result_document_content_raises_error(mock_websockets_connect
 # Restart Tests
 
 
-def test_connection_config_defaults_and_override(api_key, mock_websockets_connect):
+def test_connection_config_defaults_and_override(model_id, api_key, mock_websockets_connect):
     """Proactive reconnect fires a margin below the reactive timeout, and is overridable."""
-    default_model = OpenAIRealtimeModel(api_key=api_key)
+    default_model = OpenAIRealtimeModel(model_id=model_id, transcription_model_id="gpt-4o-transcribe", api_key=api_key)
     # Deadline sits below the reactive timeout so a mid-turn swap is not preempted by it.
     assert default_model.get_connection_config() == {
         "restart_after_s": OPENAI_MAX_TIMEOUT_S - OPENAI_PROACTIVE_RECONNECT_MARGIN_S
@@ -1058,10 +1614,17 @@ def test_connection_config_defaults_and_override(api_key, mock_websockets_connec
     assert default_model.usage_is_cumulative is False
 
     # Lowering timeout_s keeps the headroom rather than recreating the tie.
-    lowered_model = OpenAIRealtimeModel(api_key=api_key, timeout_s=1000)
+    lowered_model = OpenAIRealtimeModel(
+        model_id=model_id, transcription_model_id="gpt-4o-transcribe", api_key=api_key, timeout_s=1000
+    )
     assert lowered_model.get_connection_config()["restart_after_s"] == 1000 - OPENAI_PROACTIVE_RECONNECT_MARGIN_S
 
-    tuned_model = OpenAIRealtimeModel(api_key=api_key, connection={"restart_after_s": 25})
+    tuned_model = OpenAIRealtimeModel(
+        model_id=model_id,
+        transcription_model_id="gpt-4o-transcribe",
+        api_key=api_key,
+        connection={"restart_after_s": 25},
+    )
     assert tuned_model.get_connection_config()["restart_after_s"] == 25
 
 
@@ -1070,7 +1633,7 @@ def test_update_config_replaces_connection(model, connection):
     model.update_config(connection=connection)
 
     tru_config = model.get_config()
-    exp_config = {"model_id": "gpt-realtime", "params": {}, "connection": connection}
+    exp_config = {"model_id": "gpt-realtime-2.1", "params": {}, "connection": connection}
     assert tru_config == exp_config
     assert model.get_connection_config() == connection
 
@@ -1135,7 +1698,75 @@ async def test_restart_reestablishes_and_replays_history(mock_websockets_connect
         for event in events
         if event["type"] == "conversation.item.create" and event["item"].get("role") == "user"
     ]
-    assert user_items == [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hello"}]}]
+    assert user_items == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Hello"}],
+        }
+    ]
+
+    await model.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [True, False])
+async def test_start_resets_connection_state(model, restart):
+    """Only a restart carries outstanding tools into the fresh connection."""
+    await model.start()
+    state = model._session_state
+    state.started_transcripts["transcript"] = True
+    state.assistant_parts["response"] = ("item", 0)
+    state.audio_content_ids["response"] = "audio"
+    state.active_responses.add("response")
+    state.pending_tools.update({"a", "b"})
+    state.pending_input_ids.add("input")
+    state.input_audio_pending = True
+    state.response_pending = True
+    state.response_requested = True
+
+    if restart:
+        await model.restart()
+    else:
+        await model.stop()
+        await model.start()
+
+    exp_state = _SessionState(pending_tools={"a", "b"} if restart else set(), lock=unittest.mock.ANY)
+    assert model._session_state == exp_state
+    assert model._session_state is not state
+    assert model._session_state.pending_tools is not state.pending_tools
+    await model.stop()
+
+
+@pytest.mark.asyncio
+async def test_restart_waits_for_pending_tool_results(model, mock_websocket):
+    """A restarted connection waits for all outstanding results before requesting a response."""
+    await model.start()
+    model._session_state.pending_tools.update({"a", "b"})
+    await model.restart()
+    mock_websocket.send.reset_mock()
+
+    exp_events = []
+    for call_id in ("a", "b"):
+        await model.send(
+            BidiMessage(content=[ToolResultBlock(tool_use_id=call_id, status="success", content=[{"text": call_id}])])
+        )
+        exp_events.append(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "id": unittest.mock.ANY,
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": json.dumps([{"text": call_id}]),
+                },
+            }
+        )
+        if call_id == "b":
+            exp_events.append({"type": "response.create"})
+
+        tru_events = [json.loads(call.args[0]) for call in mock_websocket.send.await_args_list]
+        assert tru_events == exp_events
 
     await model.stop()
 
@@ -1232,8 +1863,9 @@ async def test_receive_binds_websocket_per_reader(mock_websockets_connect, model
 
     reader = model.receive()
     await reader.__anext__()  # BidiConnectionStartEvent (reader not yet bound to a socket)
-    first = await reader.__anext__()  # binds to ws1, reads its message
-    assert isinstance(first, BidiAudioStreamEvent)
+    assert await anext(reader) == BidiAudioStartEvent(content_id=unittest.mock.ANY)
+    first = await anext(reader)
+    assert isinstance(first, BidiAudioDeltaEvent)
     assert first.audio == "FROM_WS1"
 
     # Swap in a replacement socket, as a reconnect would.
@@ -1244,7 +1876,9 @@ async def test_receive_binds_websocket_per_reader(mock_websockets_connect, model
     model._websocket = ws2
     blocker.set()
     tru_event = await reader.__anext__()
-    exp_event = BidiAudioStreamEvent(audio="FROM_WS1", format="pcm", sample_rate=24000, channels=1)
+    exp_event = BidiAudioDeltaEvent(
+        audio="FROM_WS1", format="pcm", sample_rate=24000, channels=1, content_id=unittest.mock.ANY
+    )
     assert tru_event == exp_event
     blocker.clear()
 
@@ -1255,3 +1889,196 @@ async def test_receive_binds_websocket_per_reader(mock_websockets_connect, model
 
     blocker.set()
     await reader.aclose()
+
+
+@pytest.mark.asyncio
+async def test_tool_results_wait_for_response_and_pending_tools(model, mock_websocket):
+    """Submit results immediately, then generate one continuation after the remaining calls finish."""
+    await model.start()
+    mock_websocket.send.reset_mock()
+    state = model._session_state
+    state.active_responses.add("response-a")
+    result_a = ToolResultBlock(tool_use_id="a", status="success", content=[{"text": "A"}])
+    result_b = ToolResultBlock(tool_use_id="b", status="success", content=[{"text": "B"}])
+    items = [
+        {
+            "type": "function_call",
+            "status": "completed",
+            "call_id": call_id,
+            "name": f"tool_{call_id}",
+            "arguments": "{}",
+        }
+        for call_id in ("a", "b")
+    ]
+    mock_websocket.recv.side_effect = [
+        *(json.dumps({"type": "response.output_item.done", "item": item}) for item in items),
+        json.dumps(
+            {
+                "type": "response.done",
+                "response": {
+                    "id": "response-a",
+                    "status": "completed",
+                    "output": items,
+                },
+            }
+        ),
+        json.dumps({"type": "response.created", "response": {"id": "response-b"}}),
+        json.dumps({"type": "response.done", "response": {"id": "response-b", "status": "completed", "output": []}}),
+    ]
+    reader = model.receive()
+    await anext(reader)  # Connection start.
+
+    assert await anext(reader) == BidiToolUseBlocksEvent([{"toolUseId": "a", "name": "tool_a", "input": {}}])
+    assert await anext(reader) == BidiToolUseBlocksEvent([{"toolUseId": "b", "name": "tool_b", "input": {}}])
+    await model.send(BidiMessage(content=[result_b]))
+    assert await anext(reader) == BidiResponseStopEvent("response-a")
+    await model._flush_response_request(state)
+    tru_events = [json.loads(call.args[0]) for call in mock_websocket.send.await_args_list]
+    exp_events = [
+        {
+            "type": "conversation.item.create",
+            "item": {
+                "id": unittest.mock.ANY,
+                "type": "function_call_output",
+                "call_id": "b",
+                "output": json.dumps([{"text": "B"}]),
+            },
+        }
+    ]
+    assert tru_events == exp_events
+
+    await model.send(BidiMessage(content=[result_a]))
+    await model._flush_response_request(state)
+    tru_events = [json.loads(call.args[0]) for call in mock_websocket.send.await_args_list]
+    exp_events += [
+        {
+            "type": "conversation.item.create",
+            "item": {
+                "id": unittest.mock.ANY,
+                "type": "function_call_output",
+                "call_id": "a",
+                "output": json.dumps([{"text": "A"}]),
+            },
+        },
+        {"type": "response.create"},
+    ]
+    assert tru_events == exp_events
+
+    assert await anext(reader) == BidiResponseStartEvent("response-b")
+    assert await anext(reader) == BidiResponseStopEvent("response-b")
+    await reader.aclose()
+    await model.stop()
+
+
+@pytest.mark.asyncio
+async def test_native_acknowledgments_correlate_inputs_and_late_transcripts(model, mock_websocket):
+
+    native_events = [
+        {"type": "input_audio_buffer.speech_started", "item_id": "speech"},
+        {"type": "input_audio_buffer.committed", "item_id": "speech"},
+        {
+            "type": "conversation.item.added",
+            "item": {"id": "speech", "role": "user", "content": [{"type": "input_audio"}]},
+        },
+        {"type": "response.created", "response": {"id": "a"}},
+        {"type": "response.done", "response": {"id": "a"}},
+        {"type": "conversation.item.added", "item": {"id": "text", "role": "user"}},
+        {"type": "response.created", "response": {"id": "b"}},
+        {
+            "type": "conversation.item.input_audio_transcription.completed",
+            "item_id": "speech",
+            "transcript": "Earlier speech",
+        },
+        {"type": "response.done", "response": {"id": "b"}},
+    ]
+    mock_websocket.recv.side_effect = [json.dumps(event) for event in native_events]
+    await model.start()
+    tru_events = []
+    async for event in model.receive():
+        if not isinstance(event, BidiConnectionStartEvent):
+            tru_events.append(event)
+        if event == BidiResponseStopEvent("b"):
+            break
+    assert tru_events == [
+        BidiBargeInEvent("user_speech"),
+        BidiTranscriptStartEvent("user", content_id="speech"),
+        BidiResponseStartEvent("a"),
+        BidiResponseStopEvent("a"),
+        BidiResponseStartEvent("b"),
+        BidiTranscriptDeltaEvent("Earlier speech", "user", content_id="speech"),
+        BidiTranscriptStopEvent("user", content_id="speech"),
+        BidiResponseStopEvent("b"),
+    ]
+    await model.stop()
+
+
+@pytest.mark.asyncio
+async def test_history_acknowledgment_is_not_new_input(model, mock_websocket):
+    await model.start(messages=[{"role": "user", "content": [{"text": "Earlier question"}]}])
+    sent = [json.loads(call.args[0]) for call in mock_websocket.send.call_args_list]
+    history_item = next(event["item"] for event in sent if event["type"] == "conversation.item.create")
+    state = model._session_state
+    assert model._convert_openai_event({"type": "conversation.item.added", "item": history_item}, state) is None
+    assert model._convert_openai_event({"type": "response.created", "response": {"id": "new"}}, state) == [
+        BidiResponseStartEvent("new")
+    ]
+    await model.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "block",
+    [
+        TextBlock("Also consider this."),
+        ToolResultBlock(tool_use_id="call", status="success", content=[{"text": "Result"}]),
+    ],
+    ids=["text", "tool"],
+)
+@pytest.mark.parametrize("acknowledged_before_response", [True, False], ids=["early-ack", "late-ack"])
+async def test_receive_defers_response_during_speech(model, mock_websocket, block, acknowledged_before_response):
+    model.update_config(params={"audio": {"input": {"transcription": None}}})
+    await model.start()
+    mock_websocket.send.reset_mock()
+    state = model._session_state
+    state.active_responses.add("previous")
+    mock_websocket.recv.return_value = json.dumps({"type": "input_audio_buffer.speech_started", "item_id": "speech"})
+
+    reader = model.receive()
+    try:
+        await anext(reader)
+        assert await anext(reader) == BidiBargeInEvent("user_speech")
+
+        await model.send(BidiMessage(content=[block]))
+        mock_websocket.send.assert_awaited_once()
+        input_event = json.loads(mock_websocket.send.call_args.args[0])
+        acknowledgment = {"type": "conversation.item.added", "item": input_event["item"]}
+        response = {"type": "response.created", "response": {"id": "answer"}}
+        response_events = [acknowledgment, response] if acknowledged_before_response else [response, acknowledgment]
+        native_events = [
+            {"type": "response.done", "response": {"id": "previous"}},
+            {"type": "input_audio_buffer.speech_stopped", "item_id": "speech"},
+            {"type": "input_audio_buffer.committed", "item_id": "speech"},
+            *response_events,
+            {"type": "response.done", "response": {"id": "answer"}},
+        ]
+        mock_websocket.recv.side_effect = [json.dumps(event) for event in native_events]
+
+        exp_events = [
+            BidiResponseStopEvent("previous"),
+            BidiResponseStartEvent("answer"),
+            BidiResponseStopEvent("answer"),
+        ]
+        tru_events = [await anext(reader) for _ in exp_events]
+        assert tru_events == exp_events
+        mock_websocket.send.assert_awaited_once()
+
+        await model._flush_response_request(state)
+
+        tru_events = [json.loads(call.args[0]) for call in mock_websocket.send.await_args_list]
+        exp_events = [input_event]
+        if not acknowledged_before_response:
+            exp_events.append({"type": "response.create"})
+        assert tru_events == exp_events
+    finally:
+        await reader.aclose()
+        await model.stop()

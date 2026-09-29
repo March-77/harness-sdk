@@ -6,7 +6,7 @@ capabilities with real-time audio and persistent connection support.
 Key features:
 
 - Audio output events with standardized formats
-- Interruption detection and handling
+- Barge-in detection and handling
 - Connection lifecycle management
 - Provider-agnostic event types
 - Type-safe discriminated unions with TypedEvent
@@ -24,10 +24,11 @@ Audio format normalization:
 import logging
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
-from ....types._events import ToolUseStreamEvent, TypedEvent
+from ....types._events import TypedEvent
+from ....types.tools import ToolUse
 
 if TYPE_CHECKING:
-    from ..models.model import BidiModelTimeoutError
+    from ..models.model import ConnectionTimeoutError
 
 logger = logging.getLogger(__name__)
 
@@ -77,26 +78,12 @@ def _normalize_role(role: Any, default: Role = "user") -> Role:
     return cast(Role, normalized)
 
 
-StopReason = Literal["complete", "error", "interrupted", "tool_use"]
-"""Reason for the model ending its response generation.
-
-- "complete": Model completed its response.
-- "error": Model encountered an error.
-- "interrupted": Model was interrupted by the user.
-- "tool_use": Model is requesting a tool use.
-"""
-
-# ============================================================================
-# Output Events (received via agent.receive())
-# ============================================================================
-
-
 class BidiConnectionStartEvent(TypedEvent):
     """Streaming connection established and ready for interaction.
 
     Parameters:
         connection_id: Unique identifier for this streaming connection.
-        model: Model identifier (e.g., "gpt-realtime", "gemini-2.0-flash-live").
+        model: Model identifier (e.g., "gpt-realtime-2.1", "gemini-3.8-live").
     """
 
     def __init__(self, connection_id: str, model: str):
@@ -116,7 +103,7 @@ class BidiConnectionStartEvent(TypedEvent):
 
     @property
     def model(self) -> str:
-        """Model identifier (e.g., 'gpt-realtime', 'gemini-2.0-flash-live')."""
+        """Model identifier (e.g., 'gpt-realtime-2.1', 'gemini-3.8-live')."""
         return cast(str, self["model"])
 
 
@@ -138,7 +125,7 @@ class BidiConnectionRestartEvent(TypedEvent):
     def __init__(
         self,
         reason: Literal["timeout", "scheduled"],
-        timeout_error: "BidiModelTimeoutError | None" = None,
+        timeout_error: "ConnectionTimeoutError | None" = None,
         turn_interrupted: bool = False,
     ):
         """Initialize connection restart event."""
@@ -157,9 +144,9 @@ class BidiConnectionRestartEvent(TypedEvent):
         return cast(str, self["reason"])
 
     @property
-    def timeout_error(self) -> "BidiModelTimeoutError | None":
-        """Model timeout error on the reactive path; None when scheduled."""
-        return cast("BidiModelTimeoutError | None", self["timeout_error"])
+    def timeout_error(self) -> "ConnectionTimeoutError | None":
+        """Connection timeout error on the reactive path; None when scheduled."""
+        return cast("ConnectionTimeoutError | None", self["timeout_error"])
 
     @property
     def turn_interrupted(self) -> bool:
@@ -192,10 +179,10 @@ class BidiConnectionWarningEvent(TypedEvent):
 
 
 class BidiResponseStartEvent(TypedEvent):
-    """Model starts generating a response.
+    """Start of a model response.
 
     Parameters:
-        response_id: Unique identifier for this response (used in response.complete).
+        response_id: Unique identifier for this response (used in BidiResponseStopEvent).
     """
 
     def __init__(self, response_id: str):
@@ -208,14 +195,28 @@ class BidiResponseStartEvent(TypedEvent):
         return cast(str, self["response_id"])
 
 
-class BidiAudioStreamEvent(TypedEvent):
-    """Streaming audio output from the model.
+class BidiAudioStartEvent(TypedEvent):
+    """Beginning of an assistant audio stream, identified by ``content_id``."""
+
+    def __init__(self, content_id: str) -> None:
+        """Initialize audio start event."""
+        super().__init__({"type": "bidi_audio_start", "content_id": content_id})
+
+    @property
+    def content_id(self) -> str:
+        """Identifier shared by this audio stream's events."""
+        return cast(str, self["content_id"])
+
+
+class BidiAudioDeltaEvent(TypedEvent):
+    """Incremental audio output from the model.
 
     Parameters:
-        audio: Base64-encoded audio string.
+        audio: Base64-encoded audio chunk.
         format: Audio encoding format.
         sample_rate: Number of audio samples per second in Hz.
         channels: Number of audio channels (1=mono, 2=stereo).
+        content_id: Unique identifier shared by this audio stream's events.
     """
 
     def __init__(
@@ -224,21 +225,28 @@ class BidiAudioStreamEvent(TypedEvent):
         format: AudioFormat,
         sample_rate: int,
         channels: AudioChannel,
+        content_id: str,
     ):
-        """Initialize audio stream event."""
+        """Initialize audio delta event."""
         super().__init__(
             {
-                "type": "bidi_audio_stream",
+                "type": "bidi_audio_delta",
                 "audio": audio,
                 "format": format,
                 "sample_rate": sample_rate,
                 "channels": channels,
+                "content_id": content_id,
             }
         )
 
     @property
+    def content_id(self) -> str:
+        """Identifier shared by this audio stream's events."""
+        return cast(str, self["content_id"])
+
+    @property
     def audio(self) -> str:
-        """Base64-encoded audio string."""
+        """Base64-encoded audio chunk."""
         return cast(str, self["audio"])
 
     @property
@@ -257,23 +265,196 @@ class BidiAudioStreamEvent(TypedEvent):
         return cast(AudioChannel, self["channels"])
 
 
-class BidiTranscriptStreamEvent(TypedEvent):
+class BidiAudioStopEvent(TypedEvent):
+    """End of an assistant audio stream, which may still be playing."""
+
+    def __init__(self, content_id: str) -> None:
+        """Initialize audio stop event."""
+        super().__init__({"type": "bidi_audio_stop", "content_id": content_id})
+
+    @property
+    def content_id(self) -> str:
+        """Identifier shared by this audio stream's events."""
+        return cast(str, self["content_id"])
+
+
+class BidiTextStartEvent(TypedEvent):
+    """Beginning of assistant text output, identified by ``content_id``."""
+
+    def __init__(self, content_id: str):
+        """Initialize text start event."""
+        super().__init__({"type": "bidi_text_start", "content_id": content_id})
+
+    @property
+    def content_id(self) -> str:
+        """Identifier shared by this text block's events."""
+        return cast(str, self["content_id"])
+
+
+class BidiTextDeltaEvent(TypedEvent):
+    """Incremental assistant text output, separate from speech transcripts."""
+
+    def __init__(self, delta: str, content_id: str):
+        """Initialize text delta event."""
+        super().__init__({"type": "bidi_text_delta", "delta": delta, "content_id": content_id})
+
+    @property
+    def content_id(self) -> str:
+        """Identifier shared by this text block's events."""
+        return cast(str, self["content_id"])
+
+    @property
+    def delta(self) -> str:
+        """Incremental text."""
+        return cast(str, self["delta"])
+
+
+class BidiTextStopEvent(TypedEvent):
+    """End of an assistant text stream, before its completed block is emitted."""
+
+    def __init__(self, content_id: str):
+        """Initialize text stop event."""
+        super().__init__({"type": "bidi_text_stop", "content_id": content_id})
+
+    @property
+    def content_id(self) -> str:
+        """Identifier shared by this text block's events."""
+        return cast(str, self["content_id"])
+
+
+class BidiTextBlockEvent(TypedEvent):
+    """Complete assistant text, emitted after its stop event by the agent."""
+
+    def __init__(self, text: str, content_id: str):
+        """Initialize text block event."""
+        super().__init__({"type": "bidi_text_block", "text": text, "content_id": content_id})
+
+    @property
+    def content_id(self) -> str:
+        """Identifier shared by this text block's events."""
+        return cast(str, self["content_id"])
+
+    @property
+    def text(self) -> str:
+        """Complete text."""
+        return cast(str, self["text"])
+
+
+class BidiReasoningStartEvent(TypedEvent):
+    """Beginning of model-provided reasoning text, identified by ``content_id``."""
+
+    def __init__(self, content_id: str):
+        """Initialize reasoning start event."""
+        super().__init__({"type": "bidi_reasoning_start", "content_id": content_id})
+
+    @property
+    def content_id(self) -> str:
+        """Identifier shared by this reasoning block's events."""
+        return cast(str, self["content_id"])
+
+
+class BidiReasoningDeltaEvent(TypedEvent):
+    """Incremental reasoning text or thought summary exposed by the model."""
+
+    def __init__(self, delta: str, content_id: str):
+        """Initialize reasoning delta event."""
+        super().__init__({"type": "bidi_reasoning_delta", "delta": delta, "content_id": content_id})
+
+    @property
+    def content_id(self) -> str:
+        """Identifier shared by this reasoning block's events."""
+        return cast(str, self["content_id"])
+
+    @property
+    def delta(self) -> str:
+        """Incremental reasoning text."""
+        return cast(str, self["delta"])
+
+
+class BidiReasoningStopEvent(TypedEvent):
+    """End of a reasoning stream, before its completed block is emitted."""
+
+    def __init__(self, content_id: str):
+        """Initialize reasoning stop event."""
+        super().__init__({"type": "bidi_reasoning_stop", "content_id": content_id})
+
+    @property
+    def content_id(self) -> str:
+        """Identifier shared by this reasoning block's events."""
+        return cast(str, self["content_id"])
+
+
+class BidiReasoningBlockEvent(TypedEvent):
+    """Complete reasoning text, emitted after its stop event by the agent."""
+
+    def __init__(self, text: str, content_id: str):
+        """Initialize reasoning block event."""
+        super().__init__({"type": "bidi_reasoning_block", "text": text, "content_id": content_id})
+
+    @property
+    def content_id(self) -> str:
+        """Identifier shared by this reasoning block's events."""
+        return cast(str, self["content_id"])
+
+    @property
+    def text(self) -> str:
+        """Complete reasoning text or thought summary."""
+        return cast(str, self["text"])
+
+
+class BidiTranscriptStartEvent(TypedEvent):
+    """Beginning of a user or assistant transcript, before its text arrives.
+
+    Parameters:
+        role: Who is speaking ("user" or "assistant").
+        content_id: Unique identifier shared by this transcript's events.
+    """
+
+    def __init__(self, role: Role, content_id: str):
+        """Initialize transcript start event."""
+        super().__init__(
+            {
+                "type": "bidi_transcript_start",
+                "role": _normalize_role(role, default="user"),
+                "content_id": content_id,
+            }
+        )
+
+    @property
+    def content_id(self) -> str:
+        """Identifier shared by this transcript's events."""
+        return cast(str, self["content_id"])
+
+    @property
+    def role(self) -> Role:
+        """The role of the speaker."""
+        return cast(Role, self["role"])
+
+
+class BidiTranscriptDeltaEvent(TypedEvent):
     """Incremental transcription of user or assistant speech.
 
     Parameters:
         delta: The incremental transcript text.
         role: Who is speaking ("user" or "assistant").
+        content_id: Unique identifier shared by this transcript's events.
     """
 
-    def __init__(self, delta: str, role: Role):
-        """Initialize transcript stream event."""
+    def __init__(self, delta: str, role: Role, content_id: str):
+        """Initialize transcript delta event."""
         super().__init__(
             {
-                "type": "bidi_transcript_stream",
+                "type": "bidi_transcript_delta",
                 "delta": delta,
                 "role": _normalize_role(role, default="user"),
+                "content_id": content_id,
             }
         )
+
+    @property
+    def content_id(self) -> str:
+        """Identifier shared by this transcript's events."""
+        return cast(str, self["content_id"])
 
     @property
     def delta(self) -> str:
@@ -286,27 +467,63 @@ class BidiTranscriptStreamEvent(TypedEvent):
         return cast(Role, self["role"])
 
 
-class BidiTranscriptCompleteEvent(TypedEvent):
-    """Complete transcript for one user or assistant turn.
+class BidiTranscriptStopEvent(TypedEvent):
+    """End of a transcript stream, before its completed block is emitted.
 
     Parameters:
-        transcript: The complete transcript text.
         role: Who spoke ("user" or "assistant").
+        content_id: Unique identifier shared by this transcript's events.
     """
 
-    def __init__(self, transcript: str, role: Role):
-        """Initialize transcript complete event."""
+    def __init__(self, role: Role, content_id: str):
+        """Initialize transcript stop event."""
         super().__init__(
             {
-                "type": "bidi_transcript_complete",
-                "transcript": transcript,
+                "type": "bidi_transcript_stop",
                 "role": _normalize_role(role, default="user"),
+                "content_id": content_id,
             }
         )
 
     @property
+    def content_id(self) -> str:
+        """Identifier shared by this transcript's events."""
+        return cast(str, self["content_id"])
+
+    @property
+    def role(self) -> Role:
+        """The role of the speaker."""
+        return cast(Role, self["role"])
+
+
+class BidiTranscriptBlockEvent(TypedEvent):
+    """Complete transcript, emitted after its stop event by the agent.
+
+    Parameters:
+        transcript: The final transcript text.
+        role: Who spoke ("user" or "assistant").
+        content_id: Unique identifier shared by this transcript's events.
+    """
+
+    def __init__(self, transcript: str, role: Role, content_id: str):
+        """Initialize transcript block event."""
+        super().__init__(
+            {
+                "type": "bidi_transcript_block",
+                "transcript": transcript,
+                "role": _normalize_role(role, default="user"),
+                "content_id": content_id,
+            }
+        )
+
+    @property
+    def content_id(self) -> str:
+        """Identifier shared by this transcript's events."""
+        return cast(str, self["content_id"])
+
+    @property
     def transcript(self) -> str:
-        """The complete transcript text."""
+        """The final transcript text."""
         return cast(str, self["transcript"])
 
     @property
@@ -315,47 +532,41 @@ class BidiTranscriptCompleteEvent(TypedEvent):
         return cast(Role, self["role"])
 
 
-class BidiInterruptionEvent(TypedEvent):
-    """Model generation was interrupted.
+class BidiBargeInEvent(TypedEvent):
+    """Stop current response generation or playback while the session continues.
 
     Parameters:
-        reason: Why the interruption occurred.
+        reason: Why response output should stop.
     """
 
     def __init__(self, reason: Literal["user_speech", "error"]):
-        """Initialize interruption event."""
+        """Initialize barge-in event."""
         super().__init__(
             {
-                "type": "bidi_interruption",
+                "type": "bidi_barge_in",
                 "reason": reason,
             }
         )
 
     @property
     def reason(self) -> str:
-        """Why the interruption occurred."""
+        """Why response output should stop."""
         return cast(str, self["reason"])
 
 
-class BidiResponseCompleteEvent(TypedEvent):
-    """Model finished generating response.
+class BidiResponseStopEvent(TypedEvent):
+    """Response output ended. User transcription may still be pending.
 
     Parameters:
-        response_id: ID of the response that completed (matches response.start).
-        stop_reason: Why the response ended.
+        response_id: ID of the response that ended (matches BidiResponseStartEvent).
     """
 
-    def __init__(
-        self,
-        response_id: str,
-        stop_reason: StopReason,
-    ):
-        """Initialize response complete event."""
+    def __init__(self, response_id: str):
+        """Initialize response stop event."""
         super().__init__(
             {
-                "type": "bidi_response_complete",
+                "type": "bidi_response_stop",
                 "response_id": response_id,
-                "stop_reason": stop_reason,
             }
         )
 
@@ -363,11 +574,6 @@ class BidiResponseCompleteEvent(TypedEvent):
     def response_id(self) -> str:
         """Unique identifier for this response."""
         return cast(str, self["response_id"])
-
-    @property
-    def stop_reason(self) -> StopReason:
-        """Why the response ended."""
-        return cast(StopReason, self["stop_reason"])
 
 
 class ModalityUsage(dict):
@@ -454,7 +660,24 @@ class BidiUsageEvent(TypedEvent):
         return cast(int | None, self.get("cacheWriteInputTokens"))
 
 
-class BidiConnectionCloseEvent(TypedEvent):
+class BidiToolUseBlocksEvent(TypedEvent):
+    """A complete group of tool calls requested by the model.
+
+    Parameters:
+        tool_uses: Tool calls to execute together.
+    """
+
+    def __init__(self, tool_uses: list[ToolUse]):
+        """Initialize a tool-use group."""
+        super().__init__({"type": "bidi_tool_use_blocks", "tool_uses": tool_uses})
+
+    @property
+    def tool_uses(self) -> list[ToolUse]:
+        """Tool calls in provider order."""
+        return cast(list[ToolUse], self["tool_uses"])
+
+
+class BidiConnectionStopEvent(TypedEvent):
     """Streaming connection closed.
 
     Parameters:
@@ -467,10 +690,10 @@ class BidiConnectionCloseEvent(TypedEvent):
         connection_id: str,
         reason: Literal["client_disconnect", "timeout", "error", "complete", "user_request"],
     ):
-        """Initialize connection close event."""
+        """Initialize connection stop event."""
         super().__init__(
             {
-                "type": "bidi_connection_close",
+                "type": "bidi_connection_stop",
                 "connection_id": connection_id,
                 "reason": reason,
             }
@@ -483,62 +706,8 @@ class BidiConnectionCloseEvent(TypedEvent):
 
     @property
     def reason(self) -> str:
-        """Why the interruption occurred."""
+        """Why the connection was closed."""
         return cast(str, self["reason"])
-
-
-class BidiErrorEvent(TypedEvent):
-    """Error occurred during the session.
-
-    Stores the full Exception object as an instance attribute for debugging while
-    keeping the event dict JSON-serializable. The exception can be accessed via
-    the `error` property for re-raising or type-based error handling.
-
-    Parameters:
-        error: The exception that occurred.
-        details: Optional additional error information.
-    """
-
-    def __init__(
-        self,
-        error: Exception,
-        details: dict[str, Any] | None = None,
-    ):
-        """Initialize error event."""
-        # Store serializable data in dict (for JSON serialization)
-        super().__init__(
-            {
-                "type": "bidi_error",
-                "message": str(error),
-                "code": type(error).__name__,
-                "details": details,
-            }
-        )
-        # Store exception as instance attribute (not serialized)
-        self._error = error
-
-    @property
-    def error(self) -> Exception:
-        """The original exception that occurred.
-
-        Can be used for re-raising or type-based error handling.
-        """
-        return self._error
-
-    @property
-    def code(self) -> str:
-        """Error code derived from exception class name."""
-        return cast(str, self["code"])
-
-    @property
-    def message(self) -> str:
-        """Human-readable error message from the exception."""
-        return cast(str, self["message"])
-
-    @property
-    def details(self) -> dict[str, Any] | None:
-        """Additional error context beyond the exception itself."""
-        return cast(dict[str, Any] | None, self.get("details"))
 
 
 # ============================================================================
@@ -550,14 +719,25 @@ BidiOutputEvent = (
     | BidiConnectionRestartEvent
     | BidiConnectionWarningEvent
     | BidiResponseStartEvent
-    | BidiAudioStreamEvent
-    | BidiTranscriptStreamEvent
-    | BidiTranscriptCompleteEvent
-    | BidiInterruptionEvent
-    | BidiResponseCompleteEvent
+    | BidiAudioStartEvent
+    | BidiAudioDeltaEvent
+    | BidiAudioStopEvent
+    | BidiTextStartEvent
+    | BidiTextDeltaEvent
+    | BidiTextStopEvent
+    | BidiTextBlockEvent
+    | BidiReasoningStartEvent
+    | BidiReasoningDeltaEvent
+    | BidiReasoningStopEvent
+    | BidiReasoningBlockEvent
+    | BidiTranscriptStartEvent
+    | BidiTranscriptDeltaEvent
+    | BidiTranscriptStopEvent
+    | BidiTranscriptBlockEvent
+    | BidiBargeInEvent
+    | BidiResponseStopEvent
     | BidiUsageEvent
-    | BidiConnectionCloseEvent
-    | BidiErrorEvent
-    | ToolUseStreamEvent
+    | BidiConnectionStopEvent
+    | BidiToolUseBlocksEvent
 )
 """Union of different bidi output event types."""
